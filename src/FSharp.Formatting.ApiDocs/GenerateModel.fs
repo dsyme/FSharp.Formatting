@@ -269,14 +269,14 @@ type ApiDocMember (displayName: string, attributes: ApiDocAttribute list, entity
       if warn then
          for (pn, _pdoc) in comment.Parameters do
             if not (tnames.Contains (Some pn)) then
-               printfn "%s(%d,%d): warning: extraneous docs for unknown parameter '%s'" m.FileName m.StartLine m.StartColumn pn
+               Log.warnf "%s(%d,%d): warning: extraneous docs for unknown parameter '%s'" m.FileName m.StartLine m.StartColumn pn
          for (_psym, pnm, _pn, _pty) in paramTypes do
             match pnm with
             | None ->
-               printfn "%s(%d,%d): warning: a parameter was missing a name" m.FileName m.StartLine m.StartColumn
+               Log.warnf "%s(%d,%d): warning: a parameter was missing a name" m.FileName m.StartLine m.StartColumn
             | Some nm ->
                 if not (tdocs.ContainsKey pnm) then
-                   printfn "%s(%d,%d): warning: missing docs for parameter '%s'" m.FileName m.StartLine m.StartColumn nm 
+                   Log.warnf "%s(%d,%d): warning: missing docs for parameter '%s'" m.FileName m.StartLine m.StartColumn nm 
 
       [ for (psym, pnm, pn, pty) in paramTypes ->
            {| ParameterSymbol = psym
@@ -608,8 +608,7 @@ module internal CrossReferences =
                     else ""
                 sprintf "%s%s%s" name typeArgs paramList
               with exn ->
-                printfn "Error while building fsdocs-member-name for %s because: %s" memb.FullName exn.Message
-                Log.verbf "Full Exception details of previous message: %O" exn
+                Log.errorf "Error while building fsdocs-member-name for %s because: %O" memb.FullName exn
                 memb.CompiledName
             match (memb.DeclaringEntity.Value.TryFullName) with
             | None    -> ""
@@ -780,6 +779,7 @@ type internal CrossReferenceResolver (root, collectionName, qualify) =
             let memberName = memberXmlSig.Substring(2) |> removeParen
             match tryGetTypeFromMemberName memberName with
             | Some typeName ->
+                Log.warnf "warning: unable to resolve cross-reference '%s', resolving it to via type '%s' instead" memberXmlSig typeName
                 let reference = resolveCrossReferenceForTypeByXmlSig ("T:" + typeName)
                 Some { reference with NiceName = getMemberName 2 reference.HasModuleSuffix memberName }
             | None ->
@@ -800,14 +800,14 @@ type internal CrossReferenceResolver (root, collectionName, qualify) =
 
         // Compiler was unable to resolve!
         | _ when cref.StartsWith("!:")  ->
-            Log.warnf "Compiler was unable to resolve %s" cref
+            Log.warnf "warning: unable to resolve %s" cref
             None
         // ApiDocMember
         | _ when cref.[1] = ':' ->
             tryResolveCrossReferenceForMemberByXmlSig cref
         // No idea
         | _ ->
-            Log.warnf "Unresolved reference '%s'!" cref
+            Log.errorf "error: unresolved reference '%s'!" cref
             None
 
     member x.RegisterEntity entity = registerEntity entity
@@ -995,6 +995,7 @@ module internal SymbolReader =
           Assembly : AssemblyName
           XmlMemberMap : IDictionary<string, XElement>
           UrlMap : CrossReferenceResolver
+          XmlFile : string
           WarnOnMissingDocs: bool
           MarkdownComments : bool
           UrlRangeHighlight : Uri -> int -> int -> string
@@ -1011,7 +1012,7 @@ module internal SymbolReader =
 
         static member internal Create
             (publicOnly, assembly, map, sourceFolderRepo, urlRangeHighlight, mdcomments, urlMap,
-             assemblyPath, fscoptions, formatAgent, substitutions, warn ) =
+             assemblyPath, fscoptions, formatAgent, substitutions, warn, xmlFile) =
 
           { PublicOnly=publicOnly
             Assembly = assembly
@@ -1019,6 +1020,7 @@ module internal SymbolReader =
             MarkdownComments = mdcomments
             WarnOnMissingDocs = warn
             UrlMap = urlMap
+            XmlFile = xmlFile
             UrlRangeHighlight = urlRangeHighlight
             SourceFolderRepository = sourceFolderRepo
             AssemblyPath = assemblyPath
@@ -1365,7 +1367,7 @@ module internal SymbolReader =
             Some (k, v)
         | _ -> None
 
-    let rec readXmlElementAsHtml anyTagsOK (urlMap: CrossReferenceResolver) (cmds: IDictionary<_, _>)  (html: StringBuilder) (e : XElement)=
+    let rec readXmlElementAsHtml xmlFile anyTagsOK (urlMap: CrossReferenceResolver) (cmds: IDictionary<_, _>)  (html: StringBuilder) (e : XElement)=
         for x in e.Nodes() do
             if x.NodeType = XmlNodeType.Text then
                 let text = (x :?> XText).Value
@@ -1375,18 +1377,19 @@ module internal SymbolReader =
                 html.Append(text) |> ignore
             elif x.NodeType = XmlNodeType.Element then
                 let elem = x :?> XElement
+                let elemInfo = elem :> IXmlLineInfo 
                 match elem.Name.LocalName with
                 | "list" ->
                     html.Append("<ul>") |> ignore
-                    readXmlElementAsHtml anyTagsOK urlMap cmds html elem
+                    readXmlElementAsHtml xmlFile anyTagsOK urlMap cmds html elem
                     html.Append("</ul>") |> ignore
                 | "item" ->
                     html.Append("<li>") |> ignore
-                    readXmlElementAsHtml anyTagsOK urlMap cmds html elem
+                    readXmlElementAsHtml xmlFile anyTagsOK urlMap cmds html elem
                     html.Append("</li>") |> ignore
                 | "para" ->
                     html.Append("<p class='fsdocs-para'>") |> ignore
-                    readXmlElementAsHtml anyTagsOK urlMap cmds html elem
+                    readXmlElementAsHtml xmlFile anyTagsOK urlMap cmds html elem
                     html.Append("</p>") |> ignore
                 | "paramref" ->
                     let name = elem.Attribute(XName.Get "name")
@@ -1397,7 +1400,7 @@ module internal SymbolReader =
                     let cref = elem.Attribute(XName.Get "cref")
                     if cref <> null then
                         if System.String.IsNullOrEmpty(cref.Value) || cref.Value.Length < 3 then
-                            printfn "ignoring invalid cref specified in: %A" e
+                            Log.errorf "%s(%d,%d): error FD3003: invalid cref '%s'" xmlFile elemInfo.LineNumber elemInfo.LinePosition cref.Value
   
                         // Older FSharp.Core cref listings don't start with "T:", see https://github.com/dotnet/fsharp/issues/9805
                         let cname = cref.Value
@@ -1424,7 +1427,7 @@ module internal SymbolReader =
                 | _ ->
                     if anyTagsOK then html.Append(elem.ToString()) |> ignore
 
-    let readXmlCommentAsHtmlAux summaryExpected (urlMap: CrossReferenceResolver) (doc: XElement) (cmds: IDictionary<_, _>) =
+    let readXmlCommentAsHtmlAux xmlFile summaryExpected (urlMap: CrossReferenceResolver) (doc: XElement) (cmds: IDictionary<_, _>) =
         let rawData = new Dictionary<string, string>()
 
         // not part of the XML doc standard
@@ -1442,11 +1445,11 @@ module internal SymbolReader =
                 for (id, e) in List.indexed summaries do 
                      let n = if id = 0 then "summary" else "summary-" + string id
                      rawData.[n] <- e.Value
-                     readXmlElementAsHtml true urlMap cmds html e
+                     readXmlElementAsHtml xmlFile true urlMap cmds html e
                 ApiDocHtml(html.ToString()) 
             else
                 let html = new StringBuilder()
-                readXmlElementAsHtml false urlMap cmds html doc
+                readXmlElementAsHtml xmlFile false urlMap cmds html doc
                 ApiDocHtml(html.ToString())
 
         let paramNodes = doc.Elements(XName.Get "param")  |> Seq.toList
@@ -1454,7 +1457,7 @@ module internal SymbolReader =
             [ for e in paramNodes do
                  let paramName = e.Attribute(XName.Get "name").Value
                  let phtml = new StringBuilder()
-                 readXmlElementAsHtml true urlMap cmds phtml e
+                 readXmlElementAsHtml xmlFile true urlMap cmds phtml e
                  let paramHtml = ApiDocHtml(phtml.ToString())
                  paramName, paramHtml ] 
 
@@ -1478,7 +1481,7 @@ module internal SymbolReader =
                 for (id, e) in List.indexed remarkNodes do
                     let n = if id = 0 then "remarks" else "remarks-" + string id
                     rawData.[n] <- e.Value
-                    readXmlElementAsHtml true urlMap cmds html e
+                    readXmlElementAsHtml xmlFile true urlMap cmds html e
                 ApiDocHtml(html.ToString()) |> Some 
             else
                 None
@@ -1490,7 +1493,7 @@ module internal SymbolReader =
                 for (id, e) in List.indexed returnNodes do
                     let n = if id = 0 then "returns" else "returns-" + string id
                     rawData.[n] <- e.Value
-                    readXmlElementAsHtml true urlMap cmds html e
+                    readXmlElementAsHtml xmlFile true urlMap cmds html e
                 Some (ApiDocHtml(html.ToString()))
             else
                 None
@@ -1501,7 +1504,7 @@ module internal SymbolReader =
                     let cref = e.Attribute(XName.Get "cref")
                     if cref <> null then
                         if String.IsNullOrEmpty(cref.Value) || cref.Value.Length < 3 then
-                            printfn "Warning: Invalid cref specified in: %A" doc
+                            Log.warnf "Warning: Invalid cref specified in: %A" doc
 
                         else
                             // FSharp.Core cref listings don't start with "T:", see https://github.com/dotnet/fsharp/issues/9805
@@ -1512,11 +1515,11 @@ module internal SymbolReader =
                             | Some reference ->
                                 let html = new StringBuilder()
                                 rawData.["exception-" + reference.NiceName] <- reference.ReferenceLink
-                                readXmlElementAsHtml true urlMap cmds html e
+                                readXmlElementAsHtml xmlFile true urlMap cmds html e
                                 reference.NiceName, Some reference.ReferenceLink, ApiDocHtml(html.ToString())
                             | _ ->
                                 let html = new StringBuilder()
-                                readXmlElementAsHtml true urlMap cmds html e
+                                readXmlElementAsHtml xmlFile true urlMap cmds html e
                                 cname, None, ApiDocHtml(html.ToString())
                            ]
 
@@ -1526,7 +1529,7 @@ module internal SymbolReader =
                 let html = new StringBuilder()
                 let n = if id = 0 then "example" else "example-" + string id
                 rawData.[n] <- e.Value
-                readXmlElementAsHtml true urlMap cmds html e
+                readXmlElementAsHtml xmlFile true urlMap cmds html e
                 ApiDocHtml(html.ToString()) ]
  
         let notes =
@@ -1536,7 +1539,7 @@ module internal SymbolReader =
                 let html = new StringBuilder()
                 let n = if id = 0 then "note" else "note-" + string id
                 rawData.[n] <- e.Value
-                readXmlElementAsHtml true urlMap cmds html e
+                readXmlElementAsHtml xmlFile true urlMap cmds html e
                 ApiDocHtml(html.ToString()) ]
 
         // put the non-xmldoc sections into rawData
@@ -1592,14 +1595,14 @@ module internal SymbolReader =
            | [] -> None
            | xs -> Some (List.reduce combineComments xs)
 
-    let rec readXmlCommentAsHtml (urlMap : CrossReferenceResolver) (doc : XElement) (cmds: IDictionary<_, _>) =
-        let doc, nsels = readXmlCommentAsHtmlAux true urlMap doc cmds
-        let nsdocs = readNamespaceDocs urlMap nsels 
+    let rec readXmlCommentAsHtml xmlFile (urlMap : CrossReferenceResolver) (doc : XElement) (cmds: IDictionary<_, _>) =
+        let doc, nsels = readXmlCommentAsHtmlAux xmlFile true urlMap doc cmds
+        let nsdocs = readNamespaceDocs xmlFile urlMap nsels 
         doc, nsdocs
 
-    and readNamespaceDocs (urlMap : CrossReferenceResolver) (nsels : XElement list option) =
+    and readNamespaceDocs xmlFile (urlMap : CrossReferenceResolver) (nsels : XElement list option) =
         let nscmds = Dictionary() :> IDictionary<_,_>
-        nsels |> Option.map (List.map (fun n -> fst (readXmlCommentAsHtml urlMap n nscmds)) >> List.reduce combineComments)
+        nsels |> Option.map (List.map (fun n -> fst (readXmlCommentAsHtml xmlFile urlMap n nscmds)) >> List.reduce combineComments)
 
     /// Returns all indirect links in a specified span node
     let rec collectSpanIndirectLinks span =
@@ -1695,11 +1698,11 @@ module internal SymbolReader =
 
     let readXmlCommentAndCommands (ctx:ReadingContext) text el (cmds: IDictionary<_,_>) =
         let lines = removeSpaces text |> List.map (fun s -> (s, MarkdownRange.zero))
-        let html, nsdocs = readXmlCommentAsHtml ctx.UrlMap el cmds
+        let html, nsdocs = readXmlCommentAsHtml ctx.XmlFile ctx.UrlMap el cmds
         lines
           |> Seq.choose findCommand
           |> Seq.iter (fun (k, v) ->
-                printfn "The use of `[%s]` and other commands in XML comments is deprecated, please use XML extensions, see https://github.com/fsharp/fslang-design/blob/master/tooling/FST-1031-xmldoc-extensions.md" k
+                Log.warnf "The use of `[%s]` and other commands in XML comments is deprecated, please use XML extensions, see https://github.com/fsharp/fslang-design/blob/master/tooling/FST-1031-xmldoc-extensions.md" k
                 cmds.[k] <- v)
         cmds, html, nsdocs
 
@@ -1711,7 +1714,7 @@ module internal SymbolReader =
                 if ctx.WarnOnMissingDocs then
                     let m = defaultArg m range0
                     if ctx.UrlMap.IsLocal xmlSig then
-                       printfn "%s(%d,%d): warning FD0001: no documentation for '%s'" m.FileName m.StartLine m.StartColumn xmlSig
+                       Log.warnf "%s(%d,%d): warning FD0001: no documentation for '%s'" m.FileName m.StartLine m.StartColumn xmlSig
             cmds, ApiDocComment.Empty, None
         | Some el ->
             let sum = el.Element(XName.Get "summary")
@@ -1723,8 +1726,8 @@ module internal SymbolReader =
                 // why as all XML coming through here should be from F# .XML files
                 // and should have the tag.  It may be legacy of previously processing un-processed
                 // XML in raw F# source.
-                let doc, nsels = readXmlCommentAsHtmlAux false ctx.UrlMap el cmds
-                let nsdocs = readNamespaceDocs ctx.UrlMap nsels 
+                let doc, nsels = readXmlCommentAsHtmlAux ctx.XmlFile false ctx.UrlMap el cmds
+                let nsdocs = readNamespaceDocs ctx.XmlFile ctx.UrlMap nsels 
                 cmds, doc, nsdocs
             | sum ->
                 if ctx.MarkdownComments then
@@ -1765,7 +1768,7 @@ module internal SymbolReader =
                       | None -> ass.QualifiedName
                     with _ -> "unknown"
                   sprintf "unknown, part of %s" part
-            printfn "Could not read comments from entity '%s': %O" name e
+            Log.warnf "Could not read comments from entity '%s': %O" name e
             None
 
     let checkAccess ctx (access: FSharpAccessibility) =
@@ -1927,7 +1930,7 @@ module internal SymbolReader =
         let rqa = hasAttrib<RequireQualifiedAccessAttribute> typ.Attributes
         let nsdocs = combineNamespaceDocs [nsdocs1; nsdocs2; nsdocs3; nsdocs4; nsdocs5; nsdocs6 ]
         if nsdocs.IsSome then
-           printfn "ignoring namespace summary on nested position"
+           Log.warnf "ignoring namespace summary on nested position"
         let loc = tryGetLocation typ
         let location = formatSourceLocation ctx.UrlRangeHighlight ctx.SourceFolderRepository loc
         ApiDocEntity (true, name, cat, catidx, exclude, entityUrl, comment, ctx.Assembly, attrs, cases, fields, statParams, ctors,
@@ -1953,7 +1956,7 @@ module internal SymbolReader =
 
         let nsdocs = combineNamespaceDocs [nsdocs1; nsdocs2; nsdocs3; nsdocs4]
         if nsdocs.IsSome then
-           printfn "ignoring namespace summary on nested position"
+           Log.warnf "ignoring namespace summary on nested position"
  
         let loc = tryGetLocation modul
         let location = formatSourceLocation ctx.UrlRangeHighlight ctx.SourceFolderRepository loc
@@ -2013,7 +2016,7 @@ module internal SymbolReader =
       let ctx =
         ReadingContext.Create
           (publicOnly, assemblyName, xmlMemberMap, sourceFolderRepo, urlRangeHighlight,
-           mdcomments, urlMap, asmPath, codeFormatCompilerArgs, formatAgent, substitutions, warn)
+           mdcomments, urlMap, asmPath, codeFormatCompilerArgs, formatAgent, substitutions, warn, xmlFile)
              
       //
       let namespaces =
@@ -2118,7 +2121,7 @@ type ApiDocModel =
                 let bytes = File.ReadAllBytes(file)
                 Some(System.Reflection.Assembly.Load(bytes))
             with e ->
-              printfn "Couldn't load Assembly\n%s\n%s" e.Message e.StackTrace
+              Log.errorf "Couldn't load Assembly\n%s\n%s" e.Message e.StackTrace
               None
           else None )
       defaultArg asmOpt null

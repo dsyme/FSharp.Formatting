@@ -30,6 +30,7 @@ open Suave.WebSocket
 open Suave.Operators
 open Suave.Filters
 
+module Logging = FSharp.Formatting.Common.Log
 [<AutoOpen>]
 module Utils =
     let ensureDirectory path =
@@ -684,6 +685,9 @@ type CoreBuildOptions(watch) =
     [<Option("nonpublic", Default=false, Required = false, HelpText = "The tool will also generate documentation for non-public members")>]
     member val nonpublic = false with get, set
 
+    [<Option("strict", Default=false, Required = false, HelpText = "Return an error code if problems exist with documentation")>]
+    member val strict = false with get, set
+
     [<Option("mdcomments", Default=false, Required = false, HelpText = "Assume /// comments in F# code are markdown style (defaults to value of `<UsesMarkdownComments>` from project file)")>]
     member val mdcomments = false with get, set
 
@@ -700,6 +704,20 @@ type CoreBuildOptions(watch) =
     member val clean = false with get, set
 
     member x.Execute() =
+        
+        System.Diagnostics.Trace.AutoFlush <- true
+
+        let setupListener listener =
+            [ Logging.source
+              FSharp.Formatting.Internal.Log.source ]
+            |> Seq.iter (fun source ->
+                source.Switch.Level <- System.Diagnostics.SourceLevels.All
+                Logging.AddListener listener source)
+
+        FSharp.Formatting.Common.Log.ConsoleListener()
+        |> FSharp.Formatting.Common.Log.SetupListener TraceOptions.None System.Diagnostics.SourceLevels.Verbose
+        |> setupListener
+
         let protect f = 
             try
                 f()
